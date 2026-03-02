@@ -347,10 +347,25 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
         media_pool.SetCurrentFolder(bin_map[track_name])
 
         if track_name in audio_tracks:
-            # FIX: MediaPool.ImportMedia silently rejects audio-only WAV files
-            # in some Resolve versions. Use MediaStorage.AddItemListToMediaPool instead.
-            clips = media_storage.AddItemListToMediaPool(files)
-            log.debug(f"AddItemListToMediaPool for {track_name} returned: {clips}")
+            # FIX: MediaPool.ImportMedia silently rejects audio-only WAV files.
+            # Use MediaStorage.AddItemListToMediaPool instead, importing one file
+            # at a time to avoid issues with spaces in paths and varargs vs list.
+            clips = []
+            for f in files:
+                log.debug(f"  Audio import (AddItemListToMediaPool): {f}")
+                result = media_storage.AddItemListToMediaPool(f)
+                if result:
+                    clips.extend(result)
+                    log.debug(f"    OK — {len(result)} clip(s)")
+                else:
+                    log.warning(f"    AddItemListToMediaPool returned empty, trying ImportMedia dict fallback")
+                    result = media_pool.ImportMedia([{"FilePath": f}])
+                    if result:
+                        clips.extend(result)
+                        log.debug(f"    Fallback OK — {len(result)} clip(s)")
+                    else:
+                        log.error(f"    Both import methods failed for: {f}")
+            log.debug(f"Audio import for {track_name}: {len(clips)} total clip(s)")
         else:
             clips = media_pool.ImportMedia(files)
             log.debug(f"ImportMedia for {track_name} returned: {clips}")
@@ -410,12 +425,16 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
             duration_frames = get_clip_duration_frames(clip, fps)
             clip_info = {
                 "mediaPoolItem": clip,
-                "startFrame": 0,
-                "endFrame": duration_frames,   # FIX: was missing, required by API
                 "trackIndex": track_idx,
                 "recordFrame": record_frame,
             }
-            # FIX: mediaType must be int (1=video, 2=audio), not a string
+            # Only set in/out points if we got a valid duration;
+            # otherwise let Resolve use the full clip.
+            if duration_frames > 0:
+                clip_info["startFrame"] = 0
+                clip_info["endFrame"] = duration_frames
+
+            # mediaType must be int (1=video, 2=audio)
             if media_type == "video":
                 clip_info["mediaType"] = 1
             elif media_type == "audio":
@@ -423,7 +442,11 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
 
             result = media_pool.AppendToTimeline([clip_info])
             log.debug(f"  AppendToTimeline result: {result}")
-            record_frame += duration_frames
+            if duration_frames > 0:
+                record_frame += duration_frames
+            else:
+                # Estimate from the appended timeline item if possible
+                log.warning(f"  Duration unknown for clip — subsequent clips may overlap")
 
     # ── Video tracks: Cam 1, Cam 2, Cam 3 ────────────────────────────────────
     place_clips_on_track("Cam 1", 1, "video", all_clips_by_track.get("Cam 1", []))

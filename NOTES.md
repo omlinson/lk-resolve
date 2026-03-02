@@ -24,3 +24,22 @@ counts.
 
 The docstring at line 28 says the default `--silence_thresh` is `0.01`, but the
 argparse default at line 459 is `0.001`. One of these is wrong.
+
+## 4. `AddItemListToMediaPool` varargs vs list (FIXED)
+
+The Resolve API signature is `AddItemListToMediaPool(item1, item2, ...)` (varargs), but
+the code was passing a Python list as a single argument. Combined with spaces in the
+session path (e.g. `/Volumes/LaCie 4/YT Videos 2026/...`), batch imports failed
+silently. Fixed by importing audio files one at a time with a dict-format `ImportMedia`
+fallback.
+
+## 5. `place_clips_on_track` zero-duration guard (FIXED)
+
+If `GetClipProperty("Duration")` returned something unparseable, `endFrame` was set to
+0, producing an invisible zero-length clip on the timeline. Fixed by omitting
+`startFrame`/`endFrame` when duration is unknown, letting Resolve use the full clip.
+
+## 6. Track count comment is wrong (cosmetic)
+
+Line ~394 says "3 video + 4 audio" but only 3 audio tracks are used (TrLR, Tr1, Tr2).
+The 4th audio track is created but unused.
