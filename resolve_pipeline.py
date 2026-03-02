@@ -1,7 +1,7 @@
 """
 Resolve Pipeline — Main Orchestrator
 --------------------------------------
-Steps 1–7 of the editing pipelineg
+Steps 1–7 of the editing pipeline:
 
   1. Launch DaVinci Resolve
   2. Scan session folder for CAM1, CAM2, CAM3, and Audio/ZOOM#### subfolders
@@ -90,7 +90,7 @@ def scan_session(session_path):
             files = sorted([
                 os.path.join(full_path, f) for f in os.listdir(full_path)
                 if f.lower().endswith(VIDEO_EXTENSIONS)
-            ])
+            ], key=lambda f: os.stat(f).st_birthtime)
             cam_files[cam] = files
             cam_counts[cam] = len(files)
             print(f"  ✅ {cam}: {len(files)} video file(s)")
@@ -163,9 +163,9 @@ def scan_session(session_path):
         print(f"  ✅ {zoom}: TrLR, Tr1, Tr2 found")
 
     return {
-        "CAM1": cam_files["CAM1"],
-        "CAM2": cam_files["CAM2"],
-        "CAM3": cam_files["CAM3"],
+        "Cam 1": cam_files["Cam 1"],
+        "Cam 2": cam_files["Cam 2"],
+        "Cam 3": cam_files["Cam 3"],
         "TrLR": trlr_files,
         "Tr1":  tr1_files,
         "Tr2":  tr2_files,
