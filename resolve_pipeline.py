@@ -42,6 +42,8 @@ import os
 import sys
 import time
 import subprocess
+import logging
+from datetime import datetime
 
 # ── Paths to sibling scripts ───────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -58,7 +60,24 @@ VIDEO_EXTENSIONS = (".mp4", ".mov", ".mxf")
 AUDIO_EXTENSIONS = (".wav",)
 
 
-# ── Step 1: Launch DaVinci Resolve ────────────────────────────────────────────
+
+# ── Logger ────────────────────────────────────────────────────────────────────
+def setup_logger(session_path):
+    log_file = os.path.join(session_path, f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout),
+        ]
+    )
+    log = logging.getLogger("pipeline")
+    log.info(f"Log file: {log_file}")
+    return log
+
+
+
 def launch_resolve(app_path=RESOLVE_APP_PATH):
     print("\n[1/7] Launching DaVinci Resolve...")
     if not os.path.exists(app_path):
@@ -252,67 +271,91 @@ def run_xml_generation(csv_files, session_path, fps):
 
 
 # ── Step 6: Import into DaVinci Resolve ───────────────────────────────────────
-def import_into_resolve(session_files, xml_files, fps, session_path):
-    print(f"\n[6/7] Importing into DaVinci Resolve...")
+def import_into_resolve(session_files, xml_files, fps, session_path, log):
+    log.info("[6/7] Importing into DaVinci Resolve...")
 
-    # Set up Resolve scripting API
     api_path = os.path.join(RESOLVE_API_PATH, "Modules")
+    log.debug(f"Resolve API path: {api_path}")
     if api_path not in sys.path:
         sys.path.insert(0, api_path)
 
     try:
         import DaVinciResolveScript as dvr_script
-    except ImportError:
-        print(f"  ❌ Could not import DaVinciResolveScript.")
-        print(f"     Make sure Resolve is running and scripting is enabled.")
-        print(f"     API path: {api_path}")
+        log.info("DaVinciResolveScript imported OK")
+    except ImportError as e:
+        log.error(f"Could not import DaVinciResolveScript: {e}")
+        log.error(f"Make sure Resolve is running and scripting is enabled.")
         sys.exit(1)
 
+    log.info("Connecting to Resolve...")
     resolve = dvr_script.scriptapp("Resolve")
     if not resolve:
-        print("  ❌ Could not connect to DaVinci Resolve.")
+        log.error("Could not connect to DaVinci Resolve — scriptapp returned None")
         sys.exit(1)
+    log.info(f"Connected to Resolve: {resolve.GetVersionString()}")
 
-    # Give Resolve a moment to fully settle before we start calling the API
-    print("  ⏳ Waiting for Resolve to settle (5s)...")
+    log.info("Waiting for Resolve to settle (5s)...")
     time.sleep(5)
 
     pm = resolve.GetProjectManager()
+    log.debug(f"ProjectManager: {pm}")
+
     project = pm.GetCurrentProject()
     project_name = os.path.basename(session_path.rstrip("/"))
     if not project:
+        log.info(f"No current project — creating: {project_name}")
         project = pm.CreateProject(project_name)
-        print(f"  📁 Created new Resolve project: {project_name}")
+        if not project:
+            log.error(f"Failed to create project: {project_name}")
+            sys.exit(1)
+        log.info(f"Project created: {project_name}")
     else:
-        print(f"  📁 Using existing project: {project.GetName()}")
+        log.info(f"Using existing project: {project.GetName()}")
 
     media_pool = project.GetMediaPool()
+    log.debug(f"MediaPool: {media_pool}")
     root_bin = media_pool.GetRootFolder()
+    log.debug(f"Root bin: {root_bin}")
 
     def get_or_create_bin(name):
         for subfolder in root_bin.GetSubFolderList():
             if subfolder.GetName() == name:
+                log.debug(f"Bin already exists: {name}")
                 return subfolder
+        log.debug(f"Creating bin: {name}")
         return media_pool.AddSubFolder(root_bin, name)
 
     def create_timeline_from_files(timeline_name, files):
         if not files:
-            print(f"  ⚠️  Skipping {timeline_name} — no files.")
+            log.warning(f"Skipping {timeline_name} — no files provided")
             return None
+
+        log.info(f"Importing {len(files)} file(s) for timeline: {timeline_name}")
+        for f in files:
+            exists = os.path.exists(f)
+            log.debug(f"  {'✅' if exists else '❌ MISSING'} {f}")
+            if not exists:
+                log.error(f"File not found on disk: {f}")
 
         bin_folder = get_or_create_bin(timeline_name)
         media_pool.SetCurrentFolder(bin_folder)
 
+        log.debug(f"Calling ImportMedia with {len(files)} path(s)...")
         clips = media_pool.ImportMedia(files)
+        log.debug(f"ImportMedia returned: {clips}")
+
         if not clips:
-            print(f"  ⚠️  No clips imported for {timeline_name}")
+            log.error(f"ImportMedia returned nothing for {timeline_name} — check file paths and codec support")
             return None
 
+        log.info(f"Imported {len(clips)} clip(s) — creating timeline: {timeline_name}")
         timeline = media_pool.CreateTimelineFromClips(timeline_name, clips)
+        log.debug(f"CreateTimelineFromClips returned: {timeline}")
+
         if timeline:
-            print(f"  ✅ Timeline created: {timeline_name} ({len(clips)} clip(s))")
+            log.info(f"✅ Timeline created: {timeline_name} ({len(clips)} clip(s))")
         else:
-            print(f"  ⚠️  Could not create timeline: {timeline_name}")
+            log.error(f"CreateTimelineFromClips failed for: {timeline_name}")
         return timeline
 
     # Create one timeline per source folder
@@ -325,23 +368,28 @@ def import_into_resolve(session_files, xml_files, fps, session_path):
         xml_bin = get_or_create_bin("XML Chops")
         media_pool.SetCurrentFolder(xml_bin)
         for basename, xml_path in xml_files:
+            log.info(f"Importing XML: {xml_path}")
+            log.debug(f"  File exists: {os.path.exists(xml_path)}")
             import_options = {
                 "timelineName": basename,
                 "importSourceClips": False,
             }
+            log.debug(f"  import_options: {import_options}")
             imported = media_pool.ImportTimelineFromFile(xml_path, import_options)
+            log.debug(f"  ImportTimelineFromFile (with options) returned: {imported}")
             if imported:
-                print(f"  ✅ XML timeline imported: {basename}")
+                log.info(f"✅ XML timeline imported: {basename}")
             else:
-                # Fallback: try without options
+                log.warning(f"ImportTimelineFromFile with options failed — trying without options")
                 imported = media_pool.ImportTimelineFromFile(xml_path)
+                log.debug(f"  ImportTimelineFromFile (no options) returned: {imported}")
                 if imported:
-                    print(f"  ✅ XML timeline imported (fallback): {basename}")
+                    log.info(f"✅ XML timeline imported (fallback): {basename}")
                 else:
-                    print(f"  ⚠️  Failed to import XML: {os.path.basename(xml_path)}")
-                    print(f"     You can import it manually: File → Import Timeline → {xml_path}")
+                    log.error(f"Both import attempts failed for: {xml_path}")
+                    log.error(f"  Manual import: File → Import Timeline → Import AAF, EDL, XML → {xml_path}")
 
-    print("\n  ✅ All imports complete.")
+    log.info("✅ All imports complete.")
 
 
 # ── Step 7: Ding ──────────────────────────────────────────────────────────────
@@ -367,6 +415,9 @@ def main():
         print(f"Error: Session folder not found — {args.session}")
         sys.exit(1)
 
+    log = setup_logger(args.session)
+    log.info(f"Session: {args.session}")
+
     # Step 1
     launch_resolve(args.resolve_app)
 
@@ -390,7 +441,7 @@ def main():
     xml_files = run_xml_generation(csv_files, args.session, args.fps)
 
     # Step 6
-    import_into_resolve(session_files, xml_files, args.fps, args.session)
+    import_into_resolve(session_files, xml_files, args.fps, args.session, log)
 
     # Step 7
     ding()
