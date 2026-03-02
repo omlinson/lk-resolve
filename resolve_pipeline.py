@@ -60,7 +60,6 @@ VIDEO_EXTENSIONS = (".mp4", ".mov", ".mxf")
 AUDIO_EXTENSIONS = (".wav",)
 
 
-
 # ── Logger ────────────────────────────────────────────────────────────────────
 def setup_logger(session_path):
     log_file = os.path.join(session_path, f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
@@ -77,7 +76,6 @@ def setup_logger(session_path):
     return log
 
 
-
 def launch_resolve(app_path=RESOLVE_APP_PATH):
     print("\n[1/7] Launching DaVinci Resolve...")
     if not os.path.exists(app_path):
@@ -85,7 +83,6 @@ def launch_resolve(app_path=RESOLVE_APP_PATH):
         print("      Set --resolve_app to the correct path.")
         sys.exit(1)
 
-    # Check if already running
     result = subprocess.run(["pgrep", "-x", "DaVinci Resolve"], capture_output=True, text=True)
     if result.returncode == 0:
         print("  ✅ DaVinci Resolve already running.")
@@ -100,7 +97,6 @@ def launch_resolve(app_path=RESOLVE_APP_PATH):
 def scan_session(session_path):
     print(f"\n[2/7] Scanning session folder: {session_path}")
 
-    # ── Scan CAM folders ──
     cam_files = {}
     cam_counts = {}
     for cam in CAM_FOLDERS:
@@ -118,7 +114,6 @@ def scan_session(session_path):
             cam_counts[cam] = 0
             print(f"  ⚠️  {cam}: folder not found")
 
-    # ── Scan Audio/ZOOM subfolders ──
     audio_path = os.path.join(session_path, AUDIO_FOLDER)
     if not os.path.isdir(audio_path):
         print(f"\n  ❌ Audio folder not found at: {audio_path}")
@@ -137,7 +132,6 @@ def scan_session(session_path):
 
     print(f"\n  Audio/: {len(zoom_folders)} ZOOM folder(s) found: {', '.join(zoom_folders)}")
 
-    # ── Validate counts match across all CAM folders ──
     unique_counts = set(cam_counts.values())
     if len(unique_counts) > 1:
         print(f"\n  ❌ CAM folders have mismatched file counts: { {k: v for k, v in cam_counts.items()} }")
@@ -157,7 +151,6 @@ def scan_session(session_path):
 
     print(f"  ✅ Validation passed: {cam_count} take(s) across CAM + Audio folders.")
 
-    # ── Collect TrLR, Tr1, Tr2 files from each ZOOM folder ──
     trlr_files = []
     tr1_files = []
     tr2_files = []
@@ -202,7 +195,7 @@ def rename_cam_files(session_files):
         new_paths = []
         for i, old_path in enumerate(files, 1):
             ext = os.path.splitext(old_path)[1]
-            cam_label = cam.replace(" ", "")  # "Cam 1" → "Cam1"
+            cam_label = cam.replace(" ", "")
             new_name = f"{cam_label}-{i}{ext}"
             new_path = os.path.join(os.path.dirname(old_path), new_name)
             if old_path != new_path:
@@ -319,9 +312,6 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
                 return subfolder
         return media_pool.AddSubFolder(parent, name)
 
-    # ── Create bin structure matching disk hierarchy ───────────────────────────
-    # Cam 1, Cam 2, Cam 3 each get their own top-level bin
-    # TrLR, Tr1, Tr2 go inside an Audio bin
     cam_bins = {
         "Cam 1": get_or_create_bin("Cam 1"),
         "Cam 2": get_or_create_bin("Cam 2"),
@@ -335,7 +325,6 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
     }
     bin_map = {**cam_bins, **audio_bins}
 
-    # ── Import all media into their respective bins ───────────────────────────
     track_order = ["Cam 1", "Cam 2", "Cam 3", "TrLR", "Tr1", "Tr2"]
 
     all_clips_by_track = {}
@@ -365,22 +354,29 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
 
     # ── Create a single empty timeline ───────────────────────────────────────
     log.info(f"Creating timeline: {project_name}")
+
+    # FIX: set frame rate before creating the timeline
+    project.SetSetting("timelineFrameRate", str(fps))
+
     timeline = media_pool.CreateEmptyTimeline(project_name)
     if not timeline:
         log.error("Failed to create empty timeline")
         sys.exit(1)
     log.info(f"Empty timeline created: {project_name}")
 
-    # Set as current timeline so AppendToTimeline targets it
     project.SetCurrentTimeline(timeline)
-    project.SetSetting("timelineFrameRate", str(fps))
 
-    # Resolve creates 1 video + 1 audio track by default
-    # We need: 3 video (Cam 1/2/3) + 4 audio (TrLR, Tr1, Tr2, XML Chops)
-    for i in range(2):   # add 2 more video = 3 total
-        timeline.AddTrack("video")
-    for i in range(3):   # add 3 more audio = 4 total
-        timeline.AddTrack("audio")
+    # Resolve creates 1 video + 1 audio track by default.
+    # We need 3 video + 4 audio, so add 2 video and 3 audio.
+    # FIX: wrapped in try/except — AddTrack not supported on all Resolve versions
+    try:
+        for i in range(2):
+            timeline.AddTrack("video")
+        for i in range(3):
+            timeline.AddTrack("audio")
+    except Exception as e:
+        log.warning(f"AddTrack failed (may not be supported on this Resolve version): {e}")
+        log.warning("Continuing — clips will be placed on whatever tracks exist.")
 
     def get_clip_duration_frames(clip, fps):
         """Parse clip duration timecode into total frames."""
@@ -401,43 +397,50 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
         log.info(f"Placing {len(clips)} clip(s) on {media_type} track {track_idx}: {track_name}")
         record_frame = 0
         for clip in clips:
+            duration_frames = get_clip_duration_frames(clip, fps)
             clip_info = {
                 "mediaPoolItem": clip,
+                "startFrame": 0,
+                "endFrame": duration_frames,   # FIX: was missing, required by API
                 "trackIndex": track_idx,
                 "recordFrame": record_frame,
             }
-            if media_type == "audio":
-                clip_info["mediaType"] = "audio"
+            # FIX: mediaType must be int (1=video, 2=audio), not a string
+            if media_type == "video":
+                clip_info["mediaType"] = 1
+            elif media_type == "audio":
+                clip_info["mediaType"] = 2
+
             result = media_pool.AppendToTimeline([clip_info])
             log.debug(f"  AppendToTimeline result: {result}")
-            record_frame += get_clip_duration_frames(clip, fps)
+            record_frame += duration_frames
 
     # ── Video tracks: Cam 1, Cam 2, Cam 3 ────────────────────────────────────
     place_clips_on_track("Cam 1", 1, "video", all_clips_by_track.get("Cam 1", []))
     place_clips_on_track("Cam 2", 2, "video", all_clips_by_track.get("Cam 2", []))
     place_clips_on_track("Cam 3", 3, "video", all_clips_by_track.get("Cam 3", []))
 
-    # ── Audio tracks: TrLR, Tr1, Tr2, XML Chops ──────────────────────────────
+    # ── Audio tracks: TrLR, Tr1, Tr2 ─────────────────────────────────────────
     place_clips_on_track("TrLR", 1, "audio", all_clips_by_track.get("TrLR", []))
     place_clips_on_track("Tr1",  2, "audio", all_clips_by_track.get("Tr1",  []))
     place_clips_on_track("Tr2",  3, "audio", all_clips_by_track.get("Tr2",  []))
 
-    # ── XML Chops on audio track 4 ────────────────────────────────────────────
+    # ── XML Chops: import as timelines, not media ─────────────────────────────
+    # FIX: XMLs are timelines — must use ImportTimelineFromFile, not ImportMedia
     if xml_files:
-        log.info("Importing XML chops files to Media Pool...")
+        log.info("Importing XML chops as timelines...")
         xml_bin = get_or_create_bin("XML Chops", audio_bin)
         media_pool.SetCurrentFolder(xml_bin)
-        xml_clips = []
         for basename, xml_path in xml_files:
             log.debug(f"  File exists: {os.path.exists(xml_path)} — {xml_path}")
-            imported_clips = media_pool.ImportMedia([xml_path])
-            log.debug(f"  ImportMedia for XML returned: {imported_clips}")
-            if imported_clips:
-                xml_clips.extend(imported_clips)
-                log.info(f"  ✅ XML imported to Media Pool: {basename}")
+            imported_timeline = media_pool.ImportTimelineFromFile(xml_path, {
+                "timelineName": f"Chops - {basename}",
+                "importSourceClips": False,
+            })
+            if imported_timeline:
+                log.info(f"  ✅ XML timeline imported: {basename}")
             else:
-                log.error(f"  Failed to import XML to Media Pool: {xml_path}")
-        place_clips_on_track("XML Chops", 4, "audio", xml_clips)
+                log.error(f"  ❌ Failed to import XML timeline: {xml_path}")
 
     log.info("✅ All clips placed on timeline.")
 
@@ -446,7 +449,6 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
 def ding():
     print("\n[7/7] 🔔 All done!")
     subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"])
-    # Bring Resolve to the front
     subprocess.run(["open", "-a", "DaVinci Resolve"])
 
 
@@ -454,10 +456,10 @@ def ding():
 def main():
     parser = argparse.ArgumentParser(description="Resolve Pipeline — Steps 1–7")
     parser.add_argument("--session", required=True, help="Path to session folder containing CAM1, TrLR, etc.")
-    parser.add_argument("--silence_thresh", type=float, default=0.01)
+    parser.add_argument("--silence_thresh", type=float, default=0.001)
     parser.add_argument("--min_silence_ms", type=int, default=300)
     parser.add_argument("--min_voice_ms", type=int, default=1000)
-    parser.add_argument("--padding_ms", type=int, default=100)
+    parser.add_argument("--padding_ms", type=int, default=0)
     parser.add_argument("--fps", type=float, default=29.97)
     parser.add_argument("--resolve_app", default=RESOLVE_APP_PATH)
     args = parser.parse_args()
@@ -469,16 +471,9 @@ def main():
     log = setup_logger(args.session)
     log.info(f"Session: {args.session}")
 
-    # Step 1
     launch_resolve(args.resolve_app)
-
-    # Step 2
     session_files = scan_session(args.session)
-
-    # Step 2b — rename CAM files on disk
     session_files = rename_cam_files(session_files)
-
-    # Steps 3–4
     csv_files = run_silence_detection(
         trlr_files=session_files["TrLR"],
         session_path=args.session,
@@ -487,14 +482,8 @@ def main():
         min_voice_ms=args.min_voice_ms,
         padding_ms=args.padding_ms,
     )
-
-    # Step 5
     xml_files = run_xml_generation(csv_files, args.session, args.fps)
-
-    # Step 6
     import_into_resolve(session_files, xml_files, args.fps, args.session, log)
-
-    # Step 7
     ding()
 
 
