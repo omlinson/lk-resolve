@@ -312,8 +312,30 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
     media_pool = project.GetMediaPool()
     root_bin = media_pool.GetRootFolder()
 
-    # ── Import all media into Media Pool first ────────────────────────────────
-    # Track order: Cam 1, Cam 2, Cam 3, TrLR, Tr1, Tr2
+    def get_or_create_bin(name, parent=None):
+        parent = parent or root_bin
+        for subfolder in parent.GetSubFolderList():
+            if subfolder.GetName() == name:
+                return subfolder
+        return media_pool.AddSubFolder(parent, name)
+
+    # ── Create bin structure matching disk hierarchy ───────────────────────────
+    # Cam 1, Cam 2, Cam 3 each get their own top-level bin
+    # TrLR, Tr1, Tr2 go inside an Audio bin
+    cam_bins = {
+        "Cam 1": get_or_create_bin("Cam 1"),
+        "Cam 2": get_or_create_bin("Cam 2"),
+        "Cam 3": get_or_create_bin("Cam 3"),
+    }
+    audio_bin = get_or_create_bin("Audio")
+    audio_bins = {
+        "TrLR": get_or_create_bin("TrLR", audio_bin),
+        "Tr1":  get_or_create_bin("Tr1",  audio_bin),
+        "Tr2":  get_or_create_bin("Tr2",  audio_bin),
+    }
+    bin_map = {**cam_bins, **audio_bins}
+
+    # ── Import all media into their respective bins ───────────────────────────
     track_order = ["Cam 1", "Cam 2", "Cam 3", "TrLR", "Tr1", "Tr2"]
 
     all_clips_by_track = {}
@@ -331,6 +353,7 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
             if not exists:
                 log.error(f"File not found on disk: {f}")
 
+        media_pool.SetCurrentFolder(bin_map[track_name])
         clips = media_pool.ImportMedia(files)
         log.debug(f"ImportMedia for {track_name} returned: {clips}")
         if not clips:
@@ -348,55 +371,75 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
         sys.exit(1)
     log.info(f"Empty timeline created: {project_name}")
 
-    # Set timeline FPS
+    # Set as current timeline so AppendToTimeline targets it
+    project.SetCurrentTimeline(timeline)
     project.SetSetting("timelineFrameRate", str(fps))
 
-    # ── Add tracks and append clips ───────────────────────────────────────────
-    # Resolve creates 1 video + 1 audio track by default — we need 7 video tracks
-    # Add extra video tracks (we need 7 total: 6 sources + 1 chops)
-    for i in range(6):  # add 6 more = 7 total
+    # Resolve creates 1 video + 1 audio track by default
+    # We need: 3 video (Cam 1/2/3) + 4 audio (TrLR, Tr1, Tr2, XML Chops)
+    for i in range(2):   # add 2 more video = 3 total
         timeline.AddTrack("video")
+    for i in range(3):   # add 3 more audio = 4 total
+        timeline.AddTrack("audio")
 
-    for track_idx, track_name in enumerate(track_order, 1):
-        clips = all_clips_by_track.get(track_name, [])
+    def get_clip_duration_frames(clip, fps):
+        """Parse clip duration timecode into total frames."""
+        try:
+            duration = clip.GetClipProperty("Duration")
+            parts = str(duration).replace(";", ":").split(":")
+            h, m, s, f = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+            return int((h * 3600 + m * 60 + s) * round(fps) + f)
+        except Exception as e:
+            log.warning(f"  Could not parse duration: {e} — defaulting to 0")
+            return 0
+
+    def place_clips_on_track(track_name, track_idx, media_type, clips):
+        """Place all clips for a source sequentially on the given track."""
         if not clips:
-            log.warning(f"Skipping empty track {track_idx}: {track_name}")
-            continue
-
-        log.info(f"Appending {len(clips)} clip(s) to track {track_idx}: {track_name}")
+            log.warning(f"Skipping empty track {track_idx} ({media_type}): {track_name}")
+            return
+        log.info(f"Placing {len(clips)} clip(s) on {media_type} track {track_idx}: {track_name}")
+        record_frame = 0
         for clip in clips:
             clip_info = {
                 "mediaPoolItem": clip,
                 "trackIndex": track_idx,
-                "recordFrame": 0,
+                "recordFrame": record_frame,
             }
+            if media_type == "audio":
+                clip_info["mediaType"] = "audio"
             result = media_pool.AppendToTimeline([clip_info])
             log.debug(f"  AppendToTimeline result: {result}")
+            record_frame += get_clip_duration_frames(clip, fps)
 
-    # ── Import XML Chops onto Track 7 ─────────────────────────────────────────
+    # ── Video tracks: Cam 1, Cam 2, Cam 3 ────────────────────────────────────
+    place_clips_on_track("Cam 1", 1, "video", all_clips_by_track.get("Cam 1", []))
+    place_clips_on_track("Cam 2", 2, "video", all_clips_by_track.get("Cam 2", []))
+    place_clips_on_track("Cam 3", 3, "video", all_clips_by_track.get("Cam 3", []))
+
+    # ── Audio tracks: TrLR, Tr1, Tr2, XML Chops ──────────────────────────────
+    place_clips_on_track("TrLR", 1, "audio", all_clips_by_track.get("TrLR", []))
+    place_clips_on_track("Tr1",  2, "audio", all_clips_by_track.get("Tr1",  []))
+    place_clips_on_track("Tr2",  3, "audio", all_clips_by_track.get("Tr2",  []))
+
+    # ── XML Chops on audio track 4 ────────────────────────────────────────────
     if xml_files:
-        log.info("Importing XML chops onto Track 7...")
+        log.info("Importing XML chops files to Media Pool...")
+        xml_bin = get_or_create_bin("XML Chops", audio_bin)
+        media_pool.SetCurrentFolder(xml_bin)
+        xml_clips = []
         for basename, xml_path in xml_files:
-            log.info(f"  XML: {xml_path}")
-            log.debug(f"  File exists: {os.path.exists(xml_path)}")
-            import_options = {
-                "timelineName": basename,
-                "importSourceClips": False,
-            }
-            imported = media_pool.ImportTimelineFromFile(xml_path, import_options)
-            log.debug(f"  ImportTimelineFromFile returned: {imported}")
-            if imported:
-                log.info(f"  ✅ XML imported: {basename}")
+            log.debug(f"  File exists: {os.path.exists(xml_path)} — {xml_path}")
+            imported_clips = media_pool.ImportMedia([xml_path])
+            log.debug(f"  ImportMedia for XML returned: {imported_clips}")
+            if imported_clips:
+                xml_clips.extend(imported_clips)
+                log.info(f"  ✅ XML imported to Media Pool: {basename}")
             else:
-                imported = media_pool.ImportTimelineFromFile(xml_path)
-                if imported:
-                    log.info(f"  ✅ XML imported (fallback): {basename}")
-                else:
-                    log.error(f"  Both import attempts failed: {xml_path}")
-                    log.error(f"  Manual: File → Import Timeline → Import AAF, EDL, XML → {xml_path}")
+                log.error(f"  Failed to import XML to Media Pool: {xml_path}")
+        place_clips_on_track("XML Chops", 4, "audio", xml_clips)
 
-    log.info("✅ All imports complete.")
-    return resolve, project
+    log.info("✅ All clips placed on timeline.")
 
 
 # ── Step 7: Ding + open Resolve ───────────────────────────────────────────────
