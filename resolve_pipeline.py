@@ -284,7 +284,6 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
         log.info("DaVinciResolveScript imported OK")
     except ImportError as e:
         log.error(f"Could not import DaVinciResolveScript: {e}")
-        log.error(f"Make sure Resolve is running and scripting is enabled.")
         sys.exit(1)
 
     log.info("Connecting to Resolve...")
@@ -298,8 +297,6 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
     time.sleep(5)
 
     pm = resolve.GetProjectManager()
-    log.debug(f"ProjectManager: {pm}")
-
     project = pm.GetCurrentProject()
     project_name = os.path.basename(session_path.rstrip("/"))
     if not project:
@@ -313,90 +310,101 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
         log.info(f"Using existing project: {project.GetName()}")
 
     media_pool = project.GetMediaPool()
-    log.debug(f"MediaPool: {media_pool}")
     root_bin = media_pool.GetRootFolder()
-    log.debug(f"Root bin: {root_bin}")
 
-    def get_or_create_bin(name):
-        for subfolder in root_bin.GetSubFolderList():
-            if subfolder.GetName() == name:
-                log.debug(f"Bin already exists: {name}")
-                return subfolder
-        log.debug(f"Creating bin: {name}")
-        return media_pool.AddSubFolder(root_bin, name)
+    # ── Import all media into Media Pool first ────────────────────────────────
+    # Track order: Cam 1, Cam 2, Cam 3, TrLR, Tr1, Tr2
+    track_order = ["Cam 1", "Cam 2", "Cam 3", "TrLR", "Tr1", "Tr2"]
 
-    def create_timeline_from_files(timeline_name, files):
+    all_clips_by_track = {}
+    for track_name in track_order:
+        files = session_files.get(track_name, [])
         if not files:
-            log.warning(f"Skipping {timeline_name} — no files provided")
-            return None
+            log.warning(f"No files for track: {track_name}")
+            all_clips_by_track[track_name] = []
+            continue
 
-        log.info(f"Importing {len(files)} file(s) for timeline: {timeline_name}")
+        log.info(f"Importing {len(files)} file(s) for track: {track_name}")
         for f in files:
             exists = os.path.exists(f)
-            log.debug(f"  {'✅' if exists else '❌ MISSING'} {f}")
+            log.debug(f"  {'OK' if exists else 'MISSING'} {f}")
             if not exists:
                 log.error(f"File not found on disk: {f}")
 
-        bin_folder = get_or_create_bin(timeline_name)
-        media_pool.SetCurrentFolder(bin_folder)
-
-        log.debug(f"Calling ImportMedia with {len(files)} path(s)...")
         clips = media_pool.ImportMedia(files)
-        log.debug(f"ImportMedia returned: {clips}")
-
+        log.debug(f"ImportMedia for {track_name} returned: {clips}")
         if not clips:
-            log.error(f"ImportMedia returned nothing for {timeline_name} — check file paths and codec support")
-            return None
-
-        log.info(f"Imported {len(clips)} clip(s) — creating timeline: {timeline_name}")
-        timeline = media_pool.CreateTimelineFromClips(timeline_name, clips)
-        log.debug(f"CreateTimelineFromClips returned: {timeline}")
-
-        if timeline:
-            log.info(f"✅ Timeline created: {timeline_name} ({len(clips)} clip(s))")
+            log.error(f"ImportMedia returned nothing for {track_name} — check file paths and codec support")
+            all_clips_by_track[track_name] = []
         else:
-            log.error(f"CreateTimelineFromClips failed for: {timeline_name}")
-        return timeline
+            log.info(f"  {len(clips)} clip(s) imported for {track_name}")
+            all_clips_by_track[track_name] = clips
 
-    # Create one timeline per source folder
-    for folder_name, files in session_files.items():
-        if files:
-            create_timeline_from_files(folder_name, files)
+    # ── Create a single empty timeline ───────────────────────────────────────
+    log.info(f"Creating timeline: {project_name}")
+    timeline = media_pool.CreateEmptyTimeline(project_name)
+    if not timeline:
+        log.error("Failed to create empty timeline")
+        sys.exit(1)
+    log.info(f"Empty timeline created: {project_name}")
 
-    # Import XML Chops timelines
+    # Set timeline FPS
+    project.SetSetting("timelineFrameRate", str(fps))
+
+    # ── Add tracks and append clips ───────────────────────────────────────────
+    # Resolve creates 1 video + 1 audio track by default — we need 7 video tracks
+    # Add extra video tracks (we need 7 total: 6 sources + 1 chops)
+    for i in range(6):  # add 6 more = 7 total
+        timeline.AddTrack("video")
+
+    for track_idx, track_name in enumerate(track_order, 1):
+        clips = all_clips_by_track.get(track_name, [])
+        if not clips:
+            log.warning(f"Skipping empty track {track_idx}: {track_name}")
+            continue
+
+        log.info(f"Appending {len(clips)} clip(s) to track {track_idx}: {track_name}")
+        for clip in clips:
+            clip_info = {
+                "mediaPoolItem": clip,
+                "trackIndex": track_idx,
+                "recordFrame": 0,
+            }
+            result = media_pool.AppendToTimeline([clip_info])
+            log.debug(f"  AppendToTimeline result: {result}")
+
+    # ── Import XML Chops onto Track 7 ─────────────────────────────────────────
     if xml_files:
-        xml_bin = get_or_create_bin("XML Chops")
-        media_pool.SetCurrentFolder(xml_bin)
+        log.info("Importing XML chops onto Track 7...")
         for basename, xml_path in xml_files:
-            log.info(f"Importing XML: {xml_path}")
+            log.info(f"  XML: {xml_path}")
             log.debug(f"  File exists: {os.path.exists(xml_path)}")
             import_options = {
                 "timelineName": basename,
                 "importSourceClips": False,
             }
-            log.debug(f"  import_options: {import_options}")
             imported = media_pool.ImportTimelineFromFile(xml_path, import_options)
-            log.debug(f"  ImportTimelineFromFile (with options) returned: {imported}")
+            log.debug(f"  ImportTimelineFromFile returned: {imported}")
             if imported:
-                log.info(f"✅ XML timeline imported: {basename}")
+                log.info(f"  ✅ XML imported: {basename}")
             else:
-                log.warning(f"ImportTimelineFromFile with options failed — trying without options")
                 imported = media_pool.ImportTimelineFromFile(xml_path)
-                log.debug(f"  ImportTimelineFromFile (no options) returned: {imported}")
                 if imported:
-                    log.info(f"✅ XML timeline imported (fallback): {basename}")
+                    log.info(f"  ✅ XML imported (fallback): {basename}")
                 else:
-                    log.error(f"Both import attempts failed for: {xml_path}")
-                    log.error(f"  Manual import: File → Import Timeline → Import AAF, EDL, XML → {xml_path}")
+                    log.error(f"  Both import attempts failed: {xml_path}")
+                    log.error(f"  Manual: File → Import Timeline → Import AAF, EDL, XML → {xml_path}")
 
     log.info("✅ All imports complete.")
+    return resolve, project
 
 
-# ── Step 7: Ding ──────────────────────────────────────────────────────────────
+# ── Step 7: Ding + open Resolve ───────────────────────────────────────────────
 def ding():
     print("\n[7/7] 🔔 All done!")
-    # macOS system ding
     subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"])
+    # Bring Resolve to the front
+    subprocess.run(["open", "-a", "DaVinci Resolve"])
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
