@@ -172,7 +172,31 @@ def scan_session(session_path):
     }
 
 
-# ── Steps 3–4: Silence detection for each TrLR ───────────────────────────────
+# ── Rename CAM files on disk before import ────────────────────────────────────
+def rename_cam_files(session_files):
+    print(f"\n[2b/7] Renaming CAM files on disk...")
+    renamed = {}
+    for cam, files in session_files.items():
+        if not cam.startswith("Cam"):
+            renamed[cam] = files
+            continue
+        new_paths = []
+        for i, old_path in enumerate(files, 1):
+            ext = os.path.splitext(old_path)[1]
+            cam_label = cam.replace(" ", "")  # "Cam 1" → "Cam1"
+            new_name = f"{cam_label}-{i}{ext}"
+            new_path = os.path.join(os.path.dirname(old_path), new_name)
+            if old_path != new_path:
+                if os.path.exists(new_path):
+                    print(f"  ⚠️  Already exists, skipping rename: {new_name}")
+                else:
+                    os.rename(old_path, new_path)
+                    print(f"  ✅ {os.path.basename(old_path)} → {new_name}")
+            new_paths.append(new_path)
+        renamed[cam] = new_paths
+    return renamed
+
+
 def run_silence_detection(trlr_files, session_path, silence_thresh, min_silence_ms, min_voice_ms, padding_ms):
     print(f"\n[3–4/7] Running silence detection on {len(trlr_files)} TrLR file(s)...")
     csv_files = []
@@ -228,7 +252,7 @@ def run_xml_generation(csv_files, session_path, fps):
 
 
 # ── Step 6: Import into DaVinci Resolve ───────────────────────────────────────
-def import_into_resolve(session_files, xml_files, fps):
+def import_into_resolve(session_files, xml_files, fps, session_path):
     print(f"\n[6/7] Importing into DaVinci Resolve...")
 
     # Set up Resolve scripting API
@@ -249,12 +273,16 @@ def import_into_resolve(session_files, xml_files, fps):
         print("  ❌ Could not connect to DaVinci Resolve.")
         sys.exit(1)
 
+    # Give Resolve a moment to fully settle before we start calling the API
+    print("  ⏳ Waiting for Resolve to settle (5s)...")
+    time.sleep(5)
+
     pm = resolve.GetProjectManager()
     project = pm.GetCurrentProject()
+    project_name = os.path.basename(session_path.rstrip("/"))
     if not project:
-        # Create a new project named after the session folder
-        project = pm.CreateProject("Session")
-        print("  📁 Created new Resolve project: Session")
+        project = pm.CreateProject(project_name)
+        print(f"  📁 Created new Resolve project: {project_name}")
     else:
         print(f"  📁 Using existing project: {project.GetName()}")
 
@@ -275,13 +303,11 @@ def import_into_resolve(session_files, xml_files, fps):
         bin_folder = get_or_create_bin(timeline_name)
         media_pool.SetCurrentFolder(bin_folder)
 
-        # Import media
         clips = media_pool.ImportMedia(files)
         if not clips:
             print(f"  ⚠️  No clips imported for {timeline_name}")
             return None
 
-        # Create timeline
         timeline = media_pool.CreateTimelineFromClips(timeline_name, clips)
         if timeline:
             print(f"  ✅ Timeline created: {timeline_name} ({len(clips)} clip(s))")
@@ -294,18 +320,26 @@ def import_into_resolve(session_files, xml_files, fps):
         if files:
             create_timeline_from_files(folder_name, files)
 
-    # Create combined XML Chops timeline
-    xml_paths = [xml_path for _, xml_path in xml_files]
-    if xml_paths:
+    # Import XML Chops timelines
+    if xml_files:
         xml_bin = get_or_create_bin("XML Chops")
         media_pool.SetCurrentFolder(xml_bin)
-        for xml_path in xml_paths:
-            basename = os.path.splitext(os.path.basename(xml_path))[0]
-            imported = media_pool.ImportTimelineFromFile(xml_path)
+        for basename, xml_path in xml_files:
+            import_options = {
+                "timelineName": basename,
+                "importSourceClips": False,
+            }
+            imported = media_pool.ImportTimelineFromFile(xml_path, import_options)
             if imported:
                 print(f"  ✅ XML timeline imported: {basename}")
             else:
-                print(f"  ⚠️  Failed to import XML: {xml_path}")
+                # Fallback: try without options
+                imported = media_pool.ImportTimelineFromFile(xml_path)
+                if imported:
+                    print(f"  ✅ XML timeline imported (fallback): {basename}")
+                else:
+                    print(f"  ⚠️  Failed to import XML: {os.path.basename(xml_path)}")
+                    print(f"     You can import it manually: File → Import Timeline → {xml_path}")
 
     print("\n  ✅ All imports complete.")
 
@@ -339,6 +373,9 @@ def main():
     # Step 2
     session_files = scan_session(args.session)
 
+    # Step 2b — rename CAM files on disk
+    session_files = rename_cam_files(session_files)
+
     # Steps 3–4
     csv_files = run_silence_detection(
         trlr_files=session_files["TrLR"],
@@ -353,7 +390,7 @@ def main():
     xml_files = run_xml_generation(csv_files, args.session, args.fps)
 
     # Step 6
-    import_into_resolve(session_files, xml_files, args.fps)
+    import_into_resolve(session_files, xml_files, args.fps, args.session)
 
     # Step 7
     ding()
