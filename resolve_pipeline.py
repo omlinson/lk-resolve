@@ -1,15 +1,25 @@
 """
 Resolve Pipeline — Main Orchestrator
 --------------------------------------
-Steps 1–7 of the editing pipeline:
+Steps 1–7 of the editing pipelineg
 
   1. Launch DaVinci Resolve
-  2. Scan session folder for CAM1, CAM2, CAM3, TrLR, Tr1, Tr2
-  3. Count TrLR files
-  4. For each TrLR → run silence detection → generate CSV
+  2. Scan session folder for CAM1, CAM2, CAM3, and Audio/ZOOM#### subfolders
+  3. Validate: number of ZOOM subfolders must match video count in ALL CAM folders
+  4. For each TrLR wav → run silence detection → generate CSV
   5. For each CSV → generate XML (silence + voice regions)
   6. Import all tracks + XMLs into Resolve (one timeline per source type)
   7. Ding when done
+
+Expected folder structure:
+    session/
+      CAM1/         ← video files
+      CAM2/
+      CAM3/
+      Audio/
+        ZOOM0017/   ← ZOOM0017_TrLR.wav, ZOOM0017_Tr1.wav, ZOOM0017_Tr2.wav
+        ZOOM0018/
+        ...
 
 Usage:
     python resolve_pipeline.py --session /path/to/session/folder
@@ -32,7 +42,6 @@ import os
 import sys
 import time
 import subprocess
-import glob
 
 # ── Paths to sibling scripts ───────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -43,7 +52,10 @@ XML_SCRIPT = os.path.join(SCRIPT_DIR, "csv_to_resolve_xml.py")
 RESOLVE_API_PATH = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting"
 RESOLVE_APP_PATH = "/Applications/DaVinci Resolve/DaVinci Resolve.app"
 
-EXPECTED_FOLDERS = ["CAM1", "CAM2", "CAM3", "TrLR", "Tr1", "Tr2"]
+CAM_FOLDERS = ["Cam 1", "Cam 2", "Cam 3"]
+AUDIO_FOLDER = "Audio"
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".mxf")
+AUDIO_EXTENSIONS = (".wav",)
 
 
 # ── Step 1: Launch DaVinci Resolve ────────────────────────────────────────────
@@ -68,25 +80,96 @@ def launch_resolve(app_path=RESOLVE_APP_PATH):
 # ── Step 2: Scan session folder ───────────────────────────────────────────────
 def scan_session(session_path):
     print(f"\n[2/7] Scanning session folder: {session_path}")
-    found = {}
-    for folder in EXPECTED_FOLDERS:
-        full_path = os.path.join(session_path, folder)
-        if os.path.isdir(full_path):
-            files = sorted(glob.glob(os.path.join(full_path, "*.wav")) +
-                           glob.glob(os.path.join(full_path, "*.mp4")) +
-                           glob.glob(os.path.join(full_path, "*.mov")) +
-                           glob.glob(os.path.join(full_path, "*.mxf")))
-            found[folder] = files
-            print(f"  ✅ {folder}: {len(files)} file(s)")
-        else:
-            found[folder] = []
-            print(f"  ⚠️  {folder}: folder not found")
 
-    if not found["TrLR"]:
-        print("\n  ❌ No TrLR files found. Cannot continue.")
+    # ── Scan CAM folders ──
+    cam_files = {}
+    cam_counts = {}
+    for cam in CAM_FOLDERS:
+        full_path = os.path.join(session_path, cam)
+        if os.path.isdir(full_path):
+            files = sorted([
+                os.path.join(full_path, f) for f in os.listdir(full_path)
+                if f.lower().endswith(VIDEO_EXTENSIONS)
+            ])
+            cam_files[cam] = files
+            cam_counts[cam] = len(files)
+            print(f"  ✅ {cam}: {len(files)} video file(s)")
+        else:
+            cam_files[cam] = []
+            cam_counts[cam] = 0
+            print(f"  ⚠️  {cam}: folder not found")
+
+    # ── Scan Audio/ZOOM subfolders ──
+    audio_path = os.path.join(session_path, AUDIO_FOLDER)
+    if not os.path.isdir(audio_path):
+        print(f"\n  ❌ Audio folder not found at: {audio_path}")
+        print("     Hey Liam — please check the session folder structure.")
         sys.exit(1)
 
-    return found
+    zoom_folders = sorted([
+        d for d in os.listdir(audio_path)
+        if os.path.isdir(os.path.join(audio_path, d)) and d[-4:].isdigit()
+    ])
+
+    if not zoom_folders:
+        print(f"\n  ❌ No ZOOM#### subfolders found in Audio/")
+        print("     Hey Liam — please check the Audio folder.")
+        sys.exit(1)
+
+    print(f"\n  Audio/: {len(zoom_folders)} ZOOM folder(s) found: {', '.join(zoom_folders)}")
+
+    # ── Validate counts match across all CAM folders ──
+    unique_counts = set(cam_counts.values())
+    if len(unique_counts) > 1:
+        print(f"\n  ❌ CAM folders have mismatched file counts: { {k: v for k, v in cam_counts.items()} }")
+        print("     Hey Liam — please clean the CAM folders so each has the same number of files.")
+        sys.exit(1)
+
+    cam_count = list(unique_counts)[0]
+    if cam_count == 0:
+        print("\n  ❌ No video files found in any CAM folder.")
+        print("     Hey Liam — please check the CAM folders.")
+        sys.exit(1)
+
+    if len(zoom_folders) != cam_count:
+        print(f"\n  ❌ Mismatch: {len(zoom_folders)} ZOOM folder(s) in Audio vs {cam_count} video(s) in each CAM folder.")
+        print("     Hey Liam — the number of ZOOM takes must match the number of camera files.")
+        sys.exit(1)
+
+    print(f"  ✅ Validation passed: {cam_count} take(s) across CAM + Audio folders.")
+
+    # ── Collect TrLR, Tr1, Tr2 files from each ZOOM folder ──
+    trlr_files = []
+    tr1_files = []
+    tr2_files = []
+
+    for zoom in zoom_folders:
+        zoom_path = os.path.join(audio_path, zoom)
+        trlr = os.path.join(zoom_path, f"{zoom}_TrLR.wav")
+        tr1  = os.path.join(zoom_path, f"{zoom}_Tr1.wav")
+        tr2  = os.path.join(zoom_path, f"{zoom}_Tr2.wav")
+
+        missing = [f for f in [trlr, tr1, tr2] if not os.path.exists(f)]
+        if missing:
+            print(f"\n  ❌ Missing files in {zoom}/:")
+            for m in missing:
+                print(f"     {os.path.basename(m)}")
+            print("     Hey Liam — please check the Audio folder.")
+            sys.exit(1)
+
+        trlr_files.append(trlr)
+        tr1_files.append(tr1)
+        tr2_files.append(tr2)
+        print(f"  ✅ {zoom}: TrLR, Tr1, Tr2 found")
+
+    return {
+        "CAM1": cam_files["CAM1"],
+        "CAM2": cam_files["CAM2"],
+        "CAM3": cam_files["CAM3"],
+        "TrLR": trlr_files,
+        "Tr1":  tr1_files,
+        "Tr2":  tr2_files,
+    }
 
 
 # ── Steps 3–4: Silence detection for each TrLR ───────────────────────────────
