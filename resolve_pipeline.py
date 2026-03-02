@@ -303,6 +303,7 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
         log.info(f"Using existing project: {project.GetName()}")
 
     media_pool = project.GetMediaPool()
+    media_storage = resolve.GetMediaStorage()
     root_bin = media_pool.GetRootFolder()
 
     def get_or_create_bin(name, parent=None):
@@ -326,6 +327,7 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
     bin_map = {**cam_bins, **audio_bins}
 
     track_order = ["Cam 1", "Cam 2", "Cam 3", "TrLR", "Tr1", "Tr2"]
+    audio_tracks = {"TrLR", "Tr1", "Tr2"}
 
     all_clips_by_track = {}
     for track_name in track_order:
@@ -343,10 +345,18 @@ def import_into_resolve(session_files, xml_files, fps, session_path, log):
                 log.error(f"File not found on disk: {f}")
 
         media_pool.SetCurrentFolder(bin_map[track_name])
-        clips = media_pool.ImportMedia(files)
-        log.debug(f"ImportMedia for {track_name} returned: {clips}")
+
+        if track_name in audio_tracks:
+            # FIX: MediaPool.ImportMedia silently rejects audio-only WAV files
+            # in some Resolve versions. Use MediaStorage.AddItemListToMediaPool instead.
+            clips = media_storage.AddItemListToMediaPool(files)
+            log.debug(f"AddItemListToMediaPool for {track_name} returned: {clips}")
+        else:
+            clips = media_pool.ImportMedia(files)
+            log.debug(f"ImportMedia for {track_name} returned: {clips}")
+
         if not clips:
-            log.error(f"ImportMedia returned nothing for {track_name} — check file paths and codec support")
+            log.error(f"Import returned nothing for {track_name} — check file paths and codec support")
             all_clips_by_track[track_name] = []
         else:
             log.info(f"  {len(clips)} clip(s) imported for {track_name}")
