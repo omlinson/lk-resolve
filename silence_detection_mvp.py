@@ -158,10 +158,10 @@ def detect_silence_regions(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Detect silence and voice regions in a TRLR wav file.")
     parser.add_argument("--input", required=True, help="Path to TRLR .wav file")
-    parser.add_argument("--silence_thresh", type=float, default=0.01, help="RMS threshold 0.0-1.0 (default: 0.01)")
+    parser.add_argument("--silence_thresh", type=float, default=0.001, help="RMS threshold 0.0-1.0 (default: 0.01)")
     parser.add_argument("--min_silence_ms", type=int, default=300, help="Min silence duration ms (default: 300)")
     parser.add_argument("--min_voice_ms", type=int, default=1000, help="Min voice duration ms (default: 1000)")
-    parser.add_argument("--padding_ms", type=int, default=100, help="Padding around silence ms (default: 100)")
+    parser.add_argument("--padding_ms", type=int, default=0, help="Padding around silence ms (default: 100)")
     parser.add_argument("--output", default="silence_regions.csv", help="Output CSV (default: silence_regions.csv)")
     args = parser.parse_args()
 
